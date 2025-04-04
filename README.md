@@ -1,13 +1,14 @@
 # Voting API Backend
 
-A real-time voting application backend built with Node.js, Express, and Socket.IO.
+A real-time voting application backend built with Node.js, Express, Socket.IO, and SQLite.
 
 ## Features
 
 - Create and manage polls
 - Real-time vote updates using Socket.IO
 - RESTful API for poll management
-- In-memory data storage (can be extended to use a database)
+- Data persistence using SQLite database
+- CORS support for cross-origin requests
 
 ## Installation
 
@@ -25,7 +26,7 @@ npm install
 3. Create a `.env` file in the root directory with the following variables:
 ```
 PORT=5001
-CORS_ORIGIN=http://localhost:3000
+CORS_ORIGIN=*
 ```
 
 4. Start the server
@@ -34,6 +35,14 @@ npm start
 ```
 
 The server will be running at http://localhost:5001/api
+
+## Database
+
+The application uses SQLite for data persistence. The database file (`polls.db`) will be automatically created in the root directory when the server starts. It contains the following tables:
+
+- `polls`: Stores poll information
+- `options`: Stores poll options
+- `votes`: Stores votes cast by users
 
 ## API Endpoints
 
@@ -58,6 +67,7 @@ The server will be running at http://localhost:5001/api
 - Node.js
 - Express.js
 - Socket.IO
+- SQLite (for data persistence)
 - dotenv
 
 ## License
