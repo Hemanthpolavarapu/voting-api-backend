@@ -4,6 +4,8 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 // Load environment variables
 dotenv.config();
@@ -18,11 +20,25 @@ const io = socketIo(server, {
   },
 });
 
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+
 // Set up SQLite database
 const db = new sqlite3.Database('./polls.db');
 
 // Create tables if they don't exist
 db.serialize(() => {
+  // Users table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      email TEXT UNIQUE,
+      password TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+
   // Polls table
   db.run(`
     CREATE TABLE IF NOT EXISTS polls (
@@ -64,11 +80,149 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Modified authentication middleware to provide backward compatibility
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    // For backward compatibility, allow non-authenticated requests
+    // but set user to null to indicate no authentication
+    req.user = null;
+    return next();
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      // For backward compatibility, don't return error for invalid tokens
+      // just set user to null
+      req.user = null;
+      return next();
+    }
+    req.user = user;
+    next();
+  });
+};
+
 // Routes
 
 // Health check route
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Server is running', timestamp: new Date().toISOString() });
+});
+
+// Register a new user
+app.post('/api/users/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  
+  // Validate request
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  
+  try {
+    // Check if user already exists
+    db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+      if (err) {
+        console.error("Database error:", err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      if (user) {
+        return res.status(400).json({ error: 'Username already exists' });
+      }
+      
+      // Hash password
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(password, salt);
+      const createdAt = new Date().toISOString();
+      
+      // Insert new user
+      db.run(
+        'INSERT INTO users (username, email, password, created_at) VALUES (?, ?, ?, ?)',
+        [username, email || null, hashedPassword, createdAt],
+        function(err) {
+          if (err) {
+            console.error("Error creating user:", err);
+            return res.status(500).json({ error: 'Failed to create user' });
+          }
+          
+          // Generate JWT token
+          const token = jwt.sign({ id: this.lastID, username }, JWT_SECRET, { expiresIn: '7d' });
+          
+          res.status(201).json({
+            message: 'User registered successfully',
+            token,
+            username
+          });
+        }
+      );
+    });
+  } catch (error) {
+    console.error("Registration error:", error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Login user
+app.post('/api/users/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  // Validate request
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  
+  try {
+    // Find user
+    db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+      if (err) {
+        console.error("Database error:", err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      // Compare passwords
+      const isMatch = await bcrypt.compare(password, user.password);
+      
+      if (!isMatch) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      // Generate JWT token
+      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+      
+      res.json({
+        message: 'Login successful',
+        token,
+        username: user.username
+      });
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Get user profile
+app.get('/api/users/profile', authenticateToken, (req, res) => {
+  const { id } = req.user;
+  
+  db.get('SELECT id, username, email, created_at FROM users WHERE id = ?', [id], (err, user) => {
+    if (err) {
+      console.error("Database error:", err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json(user);
+  });
 });
 
 // Get all polls
@@ -193,8 +347,20 @@ app.get('/api/polls/:id', (req, res) => {
 });
 
 // Create a new poll
-app.post('/api/polls', (req, res) => {
-  const { question, options, createdBy } = req.body;
+app.post('/api/polls', authenticateToken, (req, res) => {
+  const { question, options } = req.body;
+  let createdBy;
+  
+  if (req.user) {
+    // If authenticated, use the username from the token
+    createdBy = req.user.username;
+  } else {
+    // For backward compatibility, get from request body
+    createdBy = req.body.createdBy;
+    if (!createdBy) {
+      return res.status(400).json({ error: 'createdBy is required when not authenticated' });
+    }
+  }
   
   // Validate request
   if (!question || !options || options.length < 2) {
@@ -223,7 +389,7 @@ app.post('/api/polls', (req, res) => {
         // Insert options
         const optionPromises = options.map((text, index) => {
           return new Promise((resolve, reject) => {
-            const optionId = `option-${index + 1}`;
+            const optionId = `option-${pollId}-${index + 1}`;
             db.run(
               `INSERT INTO options (id, poll_id, text) VALUES (?, ?, ?)`,
               [optionId, pollId, text],
@@ -276,13 +442,25 @@ app.post('/api/polls', (req, res) => {
 });
 
 // Submit a vote
-app.post('/api/polls/:id/vote', (req, res) => {
-  const { optionId, username } = req.body;
+app.post('/api/polls/:id/vote', authenticateToken, (req, res) => {
+  let username;
+  const { optionId } = req.body;
   const pollId = req.params.id;
   
+  if (req.user) {
+    // If authenticated, use the username from the token
+    username = req.user.username;
+  } else {
+    // For backward compatibility, get from request body
+    username = req.body.username;
+    if (!username) {
+      return res.status(400).json({ error: 'username is required when not authenticated' });
+    }
+  }
+  
   // Validate request
-  if (!optionId || !username) {
-    return res.status(400).json({ error: 'Invalid vote data' });
+  if (!optionId) {
+    return res.status(400).json({ error: 'Option ID is required' });
   }
   
   // Check if poll exists
@@ -296,58 +474,70 @@ app.post('/api/polls/:id/vote', (req, res) => {
       return res.status(404).json({ error: 'Poll not found' });
     }
     
-    // Check if option exists
-    db.get(`SELECT * FROM options WHERE id = ? AND poll_id = ?`, [optionId, pollId], (err, option) => {
+    // Check if user has already voted on this poll
+    db.get(`SELECT * FROM votes WHERE poll_id = ? AND username = ?`, [pollId, username], (err, existingVote) => {
       if (err) {
-        console.error("Error checking option:", err);
+        console.error("Error checking existing vote:", err);
         return res.status(500).json({ error: 'Database error' });
       }
       
-      if (!option) {
-        return res.status(404).json({ error: 'Option not found' });
+      if (existingVote) {
+        return res.status(400).json({ error: 'You have already voted on this poll' });
       }
       
-      // Record vote
-      const votedAt = new Date().toISOString();
-      db.run(
-        `INSERT INTO votes (poll_id, option_id, username, voted_at) VALUES (?, ?, ?, ?)`,
-        [pollId, optionId, username, votedAt],
-        function(err) {
-          if (err) {
-            console.error("Error recording vote:", err);
-            return res.status(500).json({ error: 'Database error' });
-          }
-          
-          // Get updated results
-          db.all(
-            `SELECT o.id, o.text, COUNT(v.id) as votes 
-             FROM options o 
-             LEFT JOIN votes v ON o.id = v.option_id 
-             WHERE o.poll_id = ? 
-             GROUP BY o.id`,
-            [pollId],
-            (err, results) => {
-              if (err) {
-                console.error("Error getting results:", err);
-                return res.status(500).json({ error: 'Database error' });
-              }
-              
-              // Notify all clients about updated results
-              io.to(pollId).emit('resultsUpdated', {
-                pollId,
-                results
-              });
-              
-              res.json({ 
-                success: true, 
-                pollId,
-                optionId,
-                results
-              });
-            }
-          );
+      // Check if option exists
+      db.get(`SELECT * FROM options WHERE id = ? AND poll_id = ?`, [optionId, pollId], (err, option) => {
+        if (err) {
+          console.error("Error checking option:", err);
+          return res.status(500).json({ error: 'Database error' });
         }
-      );
+        
+        if (!option) {
+          return res.status(404).json({ error: 'Option not found' });
+        }
+        
+        // Record vote
+        const votedAt = new Date().toISOString();
+        db.run(
+          `INSERT INTO votes (poll_id, option_id, username, voted_at) VALUES (?, ?, ?, ?)`,
+          [pollId, optionId, username, votedAt],
+          function(err) {
+            if (err) {
+              console.error("Error recording vote:", err);
+              return res.status(500).json({ error: 'Database error' });
+            }
+            
+            // Get updated results
+            db.all(
+              `SELECT o.id, o.text, COUNT(v.id) as votes 
+               FROM options o 
+               LEFT JOIN votes v ON o.id = v.option_id 
+               WHERE o.poll_id = ? 
+               GROUP BY o.id`,
+              [pollId],
+              (err, results) => {
+                if (err) {
+                  console.error("Error getting results:", err);
+                  return res.status(500).json({ error: 'Database error' });
+                }
+                
+                // Notify all clients about updated results
+                io.to(pollId).emit('resultsUpdated', {
+                  pollId,
+                  results
+                });
+                
+                res.json({ 
+                  success: true, 
+                  pollId,
+                  optionId,
+                  results
+                });
+              }
+            );
+          }
+        );
+      });
     });
   });
 });
