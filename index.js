@@ -45,7 +45,10 @@ db.serialize(() => {
       id TEXT PRIMARY KEY,
       question TEXT NOT NULL,
       created_by TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      start_at TEXT,
+      active_until TEXT,
+      is_active INTEGER DEFAULT 1
     )
   `);
   
@@ -227,65 +230,77 @@ app.get('/api/users/profile', authenticateToken, (req, res) => {
 
 // Get all polls
 app.get('/api/polls', (req, res) => {
-  db.all(`SELECT * FROM polls`, [], (err, polls) => {
-    if (err) {
-      console.error("Error fetching polls:", err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    // Format polls to match the API format
-    const promises = polls.map(poll => {
-      return new Promise((resolve, reject) => {
-        // Get options for this poll
-        db.all(`SELECT * FROM options WHERE poll_id = ?`, [poll.id], (err, options) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-          
-          // Get vote counts for each option
-          const optionPromises = options.map(option => {
-            return new Promise((resolve, reject) => {
-              db.get(`SELECT COUNT(*) as votes FROM votes WHERE option_id = ?`, [option.id], (err, result) => {
-                if (err) {
-                  reject(err);
-                  return;
-                }
-                
-                resolve({
-                  id: option.id,
-                  text: option.text,
-                  votes: result.votes
+  const now = new Date().toISOString();
+  
+  db.all(
+    `SELECT * FROM polls WHERE 
+     (start_at IS NULL OR start_at <= ?) AND
+     (active_until IS NULL OR active_until >= ?) AND
+     is_active = 1`,
+    [now, now],
+    (err, polls) => {
+      if (err) {
+        console.error("Error fetching polls:", err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      // Format polls to match the API format
+      const promises = polls.map(poll => {
+        return new Promise((resolve, reject) => {
+          // Get options for this poll
+          db.all(`SELECT * FROM options WHERE poll_id = ?`, [poll.id], (err, options) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            
+            // Get vote counts for each option
+            const optionPromises = options.map(option => {
+              return new Promise((resolve, reject) => {
+                db.get(`SELECT COUNT(*) as votes FROM votes WHERE option_id = ?`, [option.id], (err, result) => {
+                  if (err) {
+                    reject(err);
+                    return;
+                  }
+                  
+                  resolve({
+                    id: option.id,
+                    text: option.text,
+                    votes: result.votes
+                  });
                 });
               });
             });
+            
+            Promise.all(optionPromises)
+              .then(results => {
+                resolve({
+                  id: poll.id,
+                  question: poll.question,
+                  options: options.map(opt => ({ id: opt.id, text: opt.text })),
+                  results: results,
+                  createdBy: poll.created_by,
+                  createdAt: poll.created_at,
+                  startAt: poll.start_at,
+                  activeUntil: poll.active_until,
+                  isActive: poll.is_active === 1
+                });
+              })
+              .catch(reject);
           });
-          
-          Promise.all(optionPromises)
-            .then(results => {
-              resolve({
-                id: poll.id,
-                question: poll.question,
-                options: options.map(opt => ({ id: opt.id, text: opt.text })),
-                results: results,
-                createdBy: poll.created_by,
-                createdAt: poll.created_at
-              });
-            })
-            .catch(reject);
         });
       });
-    });
-    
-    Promise.all(promises)
-      .then(formattedPolls => {
-        res.json(formattedPolls);
-      })
-      .catch(err => {
-        console.error("Error processing polls:", err);
-        res.status(500).json({ error: 'Database error' });
-      });
-  });
+      
+      Promise.all(promises)
+        .then(formattedPolls => {
+          res.json(formattedPolls);
+        })
+        .catch(err => {
+          console.error("Error processing polls:", err);
+          res.status(500).json({ error: 'Database error' });
+        });
+    }
+  );
 });
 
 // Get a specific poll
@@ -329,13 +344,23 @@ app.get('/api/polls/:id', (req, res) => {
       
       Promise.all(promises)
         .then(results => {
+          // Check poll timing
+          const now = new Date().toISOString();
+          const isStarted = !poll.start_at || poll.start_at <= now;
+          const isActive = poll.is_active === 1 && (!poll.active_until || poll.active_until >= now);
+          
           res.json({
             id: poll.id,
             question: poll.question,
             options: options.map(opt => ({ id: opt.id, text: opt.text })),
             results: results,
             createdBy: poll.created_by,
-            createdAt: poll.created_at
+            createdAt: poll.created_at,
+            startAt: poll.start_at,
+            activeUntil: poll.active_until,
+            isActive: poll.is_active === 1,
+            isStarted,
+            hasEnded: poll.active_until && poll.active_until < now
           });
         })
         .catch(err => {
@@ -348,7 +373,7 @@ app.get('/api/polls/:id', (req, res) => {
 
 // Create a new poll
 app.post('/api/polls', authenticateToken, (req, res) => {
-  const { question, options } = req.body;
+  const { question, options, startAt, activeUntil } = req.body;
   let createdBy;
   
   if (req.user) {
@@ -377,8 +402,9 @@ app.post('/api/polls', authenticateToken, (req, res) => {
     
     // Insert poll
     db.run(
-      `INSERT INTO polls (id, question, created_by, created_at) VALUES (?, ?, ?, ?)`,
-      [pollId, question, createdBy, createdAt],
+      `INSERT INTO polls (id, question, created_by, created_at, start_at, active_until, is_active) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [pollId, question, createdBy, createdAt, startAt || null, activeUntil || null, 1],
       function(err) {
         if (err) {
           console.error("Error creating poll:", err);
@@ -423,7 +449,10 @@ app.post('/api/polls', authenticateToken, (req, res) => {
                 votes: 0
               })),
               createdBy,
-              createdAt
+              createdAt,
+              startAt: startAt || null,
+              activeUntil: activeUntil || null,
+              isActive: 1
             };
             
             // Notify all clients about new poll
@@ -441,7 +470,7 @@ app.post('/api/polls', authenticateToken, (req, res) => {
   });
 });
 
-// Submit a vote
+// Submit a vote - respect poll timing restrictions
 app.post('/api/polls/:id/vote', authenticateToken, (req, res) => {
   let username;
   const { optionId } = req.body;
@@ -463,83 +492,91 @@ app.post('/api/polls/:id/vote', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Option ID is required' });
   }
   
-  // Check if poll exists
-  db.get(`SELECT * FROM polls WHERE id = ?`, [pollId], (err, poll) => {
-    if (err) {
-      console.error("Error checking poll:", err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (!poll) {
-      return res.status(404).json({ error: 'Poll not found' });
-    }
-    
-    // Check if user has already voted on this poll
-    db.get(`SELECT * FROM votes WHERE poll_id = ? AND username = ?`, [pollId, username], (err, existingVote) => {
+  // Check if poll exists and is active
+  const now = new Date().toISOString();
+  db.get(
+    `SELECT * FROM polls WHERE id = ? AND 
+     is_active = 1 AND
+     (start_at IS NULL OR start_at <= ?) AND
+     (active_until IS NULL OR active_until >= ?)`, 
+    [pollId, now, now], 
+    (err, poll) => {
       if (err) {
-        console.error("Error checking existing vote:", err);
+        console.error("Error checking poll:", err);
         return res.status(500).json({ error: 'Database error' });
       }
       
-      if (existingVote) {
-        return res.status(400).json({ error: 'You have already voted on this poll' });
+      if (!poll) {
+        return res.status(404).json({ error: 'Poll not found or not active' });
       }
       
-      // Check if option exists
-      db.get(`SELECT * FROM options WHERE id = ? AND poll_id = ?`, [optionId, pollId], (err, option) => {
+      // Check if user has already voted on this poll
+      db.get(`SELECT * FROM votes WHERE poll_id = ? AND username = ?`, [pollId, username], (err, existingVote) => {
         if (err) {
-          console.error("Error checking option:", err);
+          console.error("Error checking existing vote:", err);
           return res.status(500).json({ error: 'Database error' });
         }
         
-        if (!option) {
-          return res.status(404).json({ error: 'Option not found' });
+        if (existingVote) {
+          return res.status(400).json({ error: 'You have already voted on this poll' });
         }
         
-        // Record vote
-        const votedAt = new Date().toISOString();
-        db.run(
-          `INSERT INTO votes (poll_id, option_id, username, voted_at) VALUES (?, ?, ?, ?)`,
-          [pollId, optionId, username, votedAt],
-          function(err) {
-            if (err) {
-              console.error("Error recording vote:", err);
-              return res.status(500).json({ error: 'Database error' });
-            }
-            
-            // Get updated results
-            db.all(
-              `SELECT o.id, o.text, COUNT(v.id) as votes 
-               FROM options o 
-               LEFT JOIN votes v ON o.id = v.option_id 
-               WHERE o.poll_id = ? 
-               GROUP BY o.id`,
-              [pollId],
-              (err, results) => {
-                if (err) {
-                  console.error("Error getting results:", err);
-                  return res.status(500).json({ error: 'Database error' });
-                }
-                
-                // Notify all clients about updated results
-                io.to(pollId).emit('resultsUpdated', {
-                  pollId,
-                  results
-                });
-                
-                res.json({ 
-                  success: true, 
-                  pollId,
-                  optionId,
-                  results
-                });
-              }
-            );
+        // Check if option exists
+        db.get(`SELECT * FROM options WHERE id = ? AND poll_id = ?`, [optionId, pollId], (err, option) => {
+          if (err) {
+            console.error("Error checking option:", err);
+            return res.status(500).json({ error: 'Database error' });
           }
-        );
+          
+          if (!option) {
+            return res.status(404).json({ error: 'Option not found' });
+          }
+          
+          // Record vote
+          const votedAt = new Date().toISOString();
+          db.run(
+            `INSERT INTO votes (poll_id, option_id, username, voted_at) VALUES (?, ?, ?, ?)`,
+            [pollId, optionId, username, votedAt],
+            function(err) {
+              if (err) {
+                console.error("Error recording vote:", err);
+                return res.status(500).json({ error: 'Database error' });
+              }
+              
+              // Get updated results
+              db.all(
+                `SELECT o.id, o.text, COUNT(v.id) as votes 
+                 FROM options o 
+                 LEFT JOIN votes v ON o.id = v.option_id 
+                 WHERE o.poll_id = ? 
+                 GROUP BY o.id`,
+                [pollId],
+                (err, results) => {
+                  if (err) {
+                    console.error("Error getting results:", err);
+                    return res.status(500).json({ error: 'Database error' });
+                  }
+                  
+                  // Notify all clients about updated results
+                  io.to(pollId).emit('resultsUpdated', {
+                    pollId,
+                    results
+                  });
+                  
+                  res.json({ 
+                    success: true, 
+                    pollId,
+                    optionId,
+                    results
+                  });
+                }
+              );
+            }
+          );
+        });
       });
-    });
-  });
+    }
+  );
 });
 
 // Get poll results
@@ -574,6 +611,191 @@ app.get('/api/polls/:id/results', (req, res) => {
       }
     );
   });
+});
+
+// Delete a poll (creator only)
+app.delete('/api/polls/:id', authenticateToken, (req, res) => {
+  const pollId = req.params.id;
+  
+  // Must be authenticated to delete a poll
+  if (!req.user) {
+    return res.status(401).json({ error: 'Authentication required to delete a poll' });
+  }
+  
+  // Check if poll exists and user is the creator
+  db.get(
+    `SELECT * FROM polls WHERE id = ?`, 
+    [pollId], 
+    (err, poll) => {
+      if (err) {
+        console.error("Error checking poll:", err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      if (!poll) {
+        return res.status(404).json({ error: 'Poll not found' });
+      }
+      
+      // Check if user is the creator
+      if (poll.created_by !== req.user.username) {
+        return res.status(403).json({ error: 'Only the poll creator can delete this poll' });
+      }
+      
+      // Start a database transaction
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        
+        // Delete votes for this poll
+        db.run(`DELETE FROM votes WHERE poll_id = ?`, [pollId], (err) => {
+          if (err) {
+            console.error("Error deleting votes:", err);
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'Database error' });
+          }
+          
+          // Delete options for this poll
+          db.run(`DELETE FROM options WHERE poll_id = ?`, [pollId], (err) => {
+            if (err) {
+              console.error("Error deleting options:", err);
+              db.run('ROLLBACK');
+              return res.status(500).json({ error: 'Database error' });
+            }
+            
+            // Delete the poll
+            db.run(`DELETE FROM polls WHERE id = ?`, [pollId], (err) => {
+              if (err) {
+                console.error("Error deleting poll:", err);
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Database error' });
+              }
+              
+              // Commit transaction
+              db.run('COMMIT');
+              
+              // Notify all clients about deleted poll
+              io.emit('pollDeleted', { pollId });
+              
+              res.json({ success: true, message: 'Poll deleted successfully' });
+            });
+          });
+        });
+      });
+    }
+  );
+});
+
+// Pause/Unpause a poll (creator only)
+app.put('/api/polls/:id/toggle-active', authenticateToken, (req, res) => {
+  const pollId = req.params.id;
+  
+  // Must be authenticated to update a poll
+  if (!req.user) {
+    return res.status(401).json({ error: 'Authentication required to update a poll' });
+  }
+  
+  // Check if poll exists and user is the creator
+  db.get(
+    `SELECT * FROM polls WHERE id = ?`, 
+    [pollId], 
+    (err, poll) => {
+      if (err) {
+        console.error("Error checking poll:", err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      if (!poll) {
+        return res.status(404).json({ error: 'Poll not found' });
+      }
+      
+      // Check if user is the creator
+      if (poll.created_by !== req.user.username) {
+        return res.status(403).json({ error: 'Only the poll creator can modify this poll' });
+      }
+      
+      // Toggle the poll's active status
+      const newStatus = poll.is_active === 1 ? 0 : 1;
+      
+      db.run(
+        `UPDATE polls SET is_active = ? WHERE id = ?`,
+        [newStatus, pollId],
+        function(err) {
+          if (err) {
+            console.error("Error updating poll status:", err);
+            return res.status(500).json({ error: 'Database error' });
+          }
+          
+          // Notify all clients about updated poll status
+          io.emit('pollStatusUpdated', { 
+            pollId, 
+            isActive: newStatus 
+          });
+          
+          res.json({ 
+            success: true, 
+            pollId,
+            isActive: newStatus
+          });
+        }
+      );
+    }
+  );
+});
+
+// Update poll timing (creator only)
+app.put('/api/polls/:id/timing', authenticateToken, (req, res) => {
+  const pollId = req.params.id;
+  const { startAt, activeUntil } = req.body;
+  
+  // Must be authenticated to update a poll
+  if (!req.user) {
+    return res.status(401).json({ error: 'Authentication required to update a poll' });
+  }
+  
+  // Check if poll exists and user is the creator
+  db.get(
+    `SELECT * FROM polls WHERE id = ?`, 
+    [pollId], 
+    (err, poll) => {
+      if (err) {
+        console.error("Error checking poll:", err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      if (!poll) {
+        return res.status(404).json({ error: 'Poll not found' });
+      }
+      
+      // Check if user is the creator
+      if (poll.created_by !== req.user.username) {
+        return res.status(403).json({ error: 'Only the poll creator can modify this poll' });
+      }
+      
+      db.run(
+        `UPDATE polls SET start_at = ?, active_until = ? WHERE id = ?`,
+        [startAt || null, activeUntil || null, pollId],
+        function(err) {
+          if (err) {
+            console.error("Error updating poll timing:", err);
+            return res.status(500).json({ error: 'Database error' });
+          }
+          
+          // Notify all clients about updated poll timing
+          io.emit('pollTimingUpdated', { 
+            pollId, 
+            startAt: startAt || null,
+            activeUntil: activeUntil || null
+          });
+          
+          res.json({ 
+            success: true, 
+            pollId,
+            startAt: startAt || null,
+            activeUntil: activeUntil || null
+          });
+        }
+      );
+    }
+  );
 });
 
 // Socket.IO handling
